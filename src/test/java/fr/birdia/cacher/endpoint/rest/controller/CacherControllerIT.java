@@ -9,7 +9,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import fr.birdia.cacher.conf.FacadeIT;
-import fr.birdia.cacher.file.bucket.BucketComponent;
+import fr.birdia.cacher.file.bucket.ExtendedBucketComponent;
 import fr.birdia.cacher.hash.SHA256;
 import java.io.File;
 import java.net.MalformedURLException;
@@ -26,7 +26,7 @@ class CacherControllerIT extends FacadeIT {
 
   @Autowired SHA256 SHA256;
 
-  @MockBean BucketComponent bucketComponent;
+  @MockBean ExtendedBucketComponent bucketComponent;
 
   @Test
   void unauthorized() {
@@ -43,7 +43,7 @@ class CacherControllerIT extends FacadeIT {
     var bucketKey = SHA256.apply(decodedUrl);
     assertEquals("8547b3662d07fb7867a11c2c89672a664fd6e4ffb370dee9f60e0e65eeebde09", bucketKey);
 
-    when(bucketComponent.download(bucketKey)).thenThrow(new RuntimeException("cache miss"));
+    when(bucketComponent.exists(bucketKey)).thenReturn(false);
     when(bucketComponent.presign(eq(bucketKey), any(Duration.class)))
         .thenReturn(
             URI.create("https://example.com/presigned?param1=3&param2=4%20param3=5").toURL());

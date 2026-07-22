@@ -2,7 +2,7 @@ package fr.birdia.cacher.service;
 
 import static java.net.http.HttpClient.newHttpClient;
 
-import fr.birdia.cacher.file.bucket.BucketComponent;
+import fr.birdia.cacher.file.bucket.ExtendedBucketComponent;
 import fr.birdia.cacher.hash.SHA256;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -20,7 +20,8 @@ import org.springframework.stereotype.Service;
 @AllArgsConstructor
 @Service
 public class CacheService {
-  private final BucketComponent bucketComponent;
+  private final ExtendedBucketComponent bucketComponent;
+
   private final SHA256 SHA256;
   private final Duration DOWNLOAD_DURATION = Duration.ofMinutes(5);
 
@@ -28,10 +29,7 @@ public class CacheService {
 
   public URL getWithCache(URL url) {
     var bucketKey = SHA256.apply(url.toString());
-    try {
-      var cachedFile = bucketComponent.download(bucketKey);
-      log.info("isCachedFile null: " + (cachedFile == null)); // TODO: clean
-    } catch (Exception e) {
+    if (!bucketComponent.exists(bucketKey)) {
       var downloadedFromSource = downloadWithGet(url);
       bucketComponent.upload(downloadedFromSource, bucketKey);
     }
