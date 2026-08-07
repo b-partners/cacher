@@ -20,8 +20,8 @@ import org.springframework.stereotype.Service;
 @AllArgsConstructor
 @Service
 public class CacheService {
+  private static final long MIN_CACHEABLE_SIZE_BYTES = 1_000_000L;
   private final ExtendedBucketComponent bucketComponent;
-
   private final SHA256 SHA256;
   private final Duration DOWNLOAD_DURATION = Duration.ofMinutes(5);
 
@@ -30,8 +30,25 @@ public class CacheService {
   public URL getWithCache(URL url) {
     var bucketKey = SHA256.apply(url.toString());
     if (!bucketComponent.exists(bucketKey)) {
-      var downloadedFromSource = downloadWithGet(url);
-      bucketComponent.upload(downloadedFromSource, bucketKey);
+      File downloadedFromSource = null;
+      try {
+        downloadedFromSource = downloadWithGet(url);
+        if (downloadedFromSource.length() < MIN_CACHEABLE_SIZE_BYTES) {
+          log.info(
+              "File downloaded from {} too small ({} bytes < {}), skipping cache",
+              url,
+              downloadedFromSource.length(),
+              MIN_CACHEABLE_SIZE_BYTES);
+          return url;
+        }
+        bucketComponent.upload(downloadedFromSource, bucketKey);
+      } finally {
+        if (downloadedFromSource != null && downloadedFromSource.exists()) {
+          if (!downloadedFromSource.delete()) {
+            log.info("Failed to delete temporary file {}", downloadedFromSource);
+          }
+        }
+      }
     }
     return bucketComponent.presign(bucketKey, DOWNLOAD_DURATION);
   }
