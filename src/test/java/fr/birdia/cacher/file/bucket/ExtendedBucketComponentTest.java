@@ -54,6 +54,22 @@ class ExtendedBucketComponentTest {
   }
 
   @Test
+  void lastModified_of_missing_object_as_bare_404() {
+    when(s3Client.headObject(any(HeadObjectRequest.class)))
+        .thenThrow(S3Exception.builder().statusCode(404).build());
+
+    assertEquals(Optional.empty(), subject.lastModified("key"));
+  }
+
+  @Test
+  void lastModified_on_other_error_fails() {
+    when(s3Client.headObject(any(HeadObjectRequest.class)))
+        .thenThrow(S3Exception.builder().statusCode(403).build());
+
+    assertThrows(S3Exception.class, () -> subject.lastModified("key"));
+  }
+
+  @Test
   void createIfAbsent_sends_conditional_put() {
     assertTrue(subject.createIfAbsent("key.lock"));
 

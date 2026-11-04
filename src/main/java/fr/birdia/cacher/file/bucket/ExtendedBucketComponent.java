@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 
 @Component
 public class ExtendedBucketComponent extends BucketComponent {
+  private static final int NOT_FOUND = 404;
   private static final int CONFLICT = 409;
   private static final int PRECONDITION_FAILED = 412;
 
@@ -38,6 +39,12 @@ public class ExtendedBucketComponent extends BucketComponent {
       return Optional.of(head.lastModified());
     } catch (NoSuchKeyException e) {
       return Optional.empty();
+    } catch (S3Exception e) {
+      // HEAD has no body: a missing key can also come back as a bare 404
+      if (e.statusCode() == NOT_FOUND) {
+        return Optional.empty();
+      }
+      throw e;
     }
   }
 

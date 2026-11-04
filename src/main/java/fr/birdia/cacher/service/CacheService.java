@@ -12,6 +12,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Optional;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,23 +33,37 @@ public class CacheService {
    */
   private final Duration staleLockAge;
 
+  /**
+   * How long we wait for a concurrent upload before doing it ourselves. Its holder may be dead
+   * without its lock being stale yet: callers would time out long before 15 minutes. Uploading the
+   * same file twice is harmless, only slower.
+   */
+  private final Duration maxWait;
+
   private final Duration pollInterval;
 
   private final HttpClient httpClient = newHttpClient();
 
   @Autowired
   public CacheService(ExtendedBucketComponent bucketComponent, SHA256 SHA256) {
-    this(bucketComponent, SHA256, Duration.ofMinutes(15), Duration.ofSeconds(1));
+    this(
+        bucketComponent,
+        SHA256,
+        Duration.ofMinutes(15),
+        Duration.ofMinutes(2),
+        Duration.ofSeconds(1));
   }
 
   CacheService(
       ExtendedBucketComponent bucketComponent,
       SHA256 SHA256,
       Duration staleLockAge,
+      Duration maxWait,
       Duration pollInterval) {
     this.bucketComponent = bucketComponent;
     this.SHA256 = SHA256;
     this.staleLockAge = staleLockAge;
+    this.maxWait = maxWait;
     this.pollInterval = pollInterval;
   }
 
@@ -56,6 +71,13 @@ public class CacheService {
     var bucketKey = SHA256.apply(url.toString());
     cacheOrWaitForOngoingUpload(url, bucketKey);
     return bucketComponent.presign(bucketKey, DOWNLOAD_DURATION);
+  }
+
+  private enum Lock {
+    ACQUIRED,
+    HELD_BY_OTHER,
+    /** The bucket refused or failed the lock operation: we go on without it. */
+    UNAVAILABLE
   }
 
   /**
@@ -68,47 +90,94 @@ public class CacheService {
    *   <li>Their upload failed (lock released without the object) or they died (stale lock): we
    *       proceed as if nothing had been started.
    * </ul>
+   *
+   * The lock only spares a second download, caching never depends on it: whenever an operation on
+   * the lock fails (missing permission, conditional writes not supported, S3 error, ...) or we have
+   * waited {@link #maxWait}, we download and upload ourselves, as without any lock.
    */
   private void cacheOrWaitForOngoingUpload(URL url, String bucketKey) {
     var lockKey = bucketKey + LOCK_SUFFIX;
-    var waiting = false;
+    Instant waitingSince = null;
     while (true) {
       if (bucketComponent.exists(bucketKey)) {
-        if (waiting) {
+        if (waitingSince != null) {
           log.info("Reusing upload of {} done by a concurrent request", url);
         }
         return;
       }
 
-      if (bucketComponent.createIfAbsent(lockKey)) {
+      var lock = tryLock(lockKey);
+      if (lock == Lock.ACQUIRED) {
         try {
           // The previous holder may have finished between our exists() check and our lock.
           if (!bucketComponent.exists(bucketKey)) {
-            bucketComponent.upload(downloadWithGet(url), bucketKey);
+            upload(url, bucketKey);
           }
           return;
         } finally {
-          bucketComponent.delete(lockKey);
+          releaseQuietly(lockKey);
         }
       }
+      if (lock == Lock.UNAVAILABLE) {
+        upload(url, bucketKey);
+        return;
+      }
 
-      var lockedAt = bucketComponent.lastModified(lockKey);
+      Optional<Instant> lockedAt;
+      try {
+        lockedAt = bucketComponent.lastModified(lockKey);
+      } catch (Exception e) {
+        log.warn("Cannot read lock {}, uploading {} without it", lockKey, url, e);
+        upload(url, bucketKey);
+        return;
+      }
       if (lockedAt.isEmpty()) {
         continue; // Lock released in the meantime: re-check right away.
       }
       if (lockedAt.get().isBefore(Instant.now().minus(staleLockAge))) {
         log.warn("Lock {} acquired at {} is stale, discarding it", lockKey, lockedAt.get());
         // Worst case, two waiters race here and both upload: same content, so harmless.
-        bucketComponent.delete(lockKey);
-        continue;
+        if (releaseQuietly(lockKey)) {
+          continue;
+        }
+        upload(url, bucketKey);
+        return;
       }
 
-      if (!waiting) {
+      if (waitingSince == null) {
         log.info("{} is being uploaded by a concurrent request, waiting for it", url);
-        waiting = true;
+        waitingSince = Instant.now();
+      } else if (Instant.now().isAfter(waitingSince.plus(maxWait))) {
+        log.warn("Waited {} for the concurrent upload of {}, uploading it ourselves", maxWait, url);
+        upload(url, bucketKey);
+        return;
       }
       sleep(pollInterval);
     }
+  }
+
+  private Lock tryLock(String lockKey) {
+    try {
+      return bucketComponent.createIfAbsent(lockKey) ? Lock.ACQUIRED : Lock.HELD_BY_OTHER;
+    } catch (Exception e) {
+      log.warn("Cannot create lock {}, going on without it", lockKey, e);
+      return Lock.UNAVAILABLE;
+    }
+  }
+
+  /** Never fails: a lock left behind only makes the next requests wait, at most maxWait. */
+  private boolean releaseQuietly(String lockKey) {
+    try {
+      bucketComponent.delete(lockKey);
+      return true;
+    } catch (Exception e) {
+      log.warn("Cannot delete lock {}", lockKey, e);
+      return false;
+    }
+  }
+
+  private void upload(URL url, String bucketKey) {
+    bucketComponent.upload(downloadWithGet(url), bucketKey);
   }
 
   private static void sleep(Duration duration) {

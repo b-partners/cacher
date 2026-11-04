@@ -26,14 +26,16 @@ import java.util.Optional;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 
 class CacheServiceTest {
   private static final Duration STALE_LOCK_AGE = Duration.ofMinutes(15);
+  private static final Duration MAX_WAIT = Duration.ofMillis(50);
 
   ExtendedBucketComponent bucketComponent = mock();
   SHA256 sha256 = new SHA256();
   CacheService subject =
-      new CacheService(bucketComponent, sha256, STALE_LOCK_AGE, Duration.ofMillis(1));
+      new CacheService(bucketComponent, sha256, STALE_LOCK_AGE, MAX_WAIT, Duration.ofMillis(1));
 
   HttpServer source;
   URL url;
@@ -144,5 +146,79 @@ class CacheServiceTest {
     assertThrows(RuntimeException.class, () -> subject.getWithCache(url));
 
     verify(bucketComponent, times(1)).delete(lockKey);
+  }
+
+  @Test
+  void lock_that_cannot_be_created_does_not_prevent_caching() {
+    when(bucketComponent.exists(bucketKey)).thenReturn(false);
+    when(bucketComponent.createIfAbsent(lockKey)).thenThrow(accessDenied());
+
+    assertEquals(presigned, subject.getWithCache(url));
+
+    verify(bucketComponent, times(1)).upload(any(File.class), eq(bucketKey));
+    verify(bucketComponent, never()).delete(anyString());
+  }
+
+  @Test
+  void lock_that_cannot_be_deleted_does_not_fail_the_upload() {
+    when(bucketComponent.exists(bucketKey)).thenReturn(false);
+    when(bucketComponent.createIfAbsent(lockKey)).thenReturn(true);
+    doThrow(accessDenied()).when(bucketComponent).delete(lockKey);
+
+    assertEquals(presigned, subject.getWithCache(url));
+
+    verify(bucketComponent, times(1)).upload(any(File.class), eq(bucketKey));
+  }
+
+  @Test
+  void own_failed_upload_is_reported_even_if_lock_cannot_be_deleted() {
+    when(bucketComponent.exists(bucketKey)).thenReturn(false);
+    when(bucketComponent.createIfAbsent(lockKey)).thenReturn(true);
+    doThrow(new RuntimeException("S3 down")).when(bucketComponent).upload(any(), eq(bucketKey));
+    doThrow(accessDenied()).when(bucketComponent).delete(lockKey);
+
+    var actual = assertThrows(RuntimeException.class, () -> subject.getWithCache(url));
+
+    assertEquals("S3 down", actual.getMessage());
+  }
+
+  @Test
+  void lock_that_cannot_be_read_does_not_prevent_caching() {
+    when(bucketComponent.exists(bucketKey)).thenReturn(false);
+    when(bucketComponent.createIfAbsent(lockKey)).thenReturn(false);
+    when(bucketComponent.lastModified(lockKey)).thenThrow(accessDenied());
+
+    assertEquals(presigned, subject.getWithCache(url));
+
+    verify(bucketComponent, times(1)).upload(any(File.class), eq(bucketKey));
+  }
+
+  @Test
+  void stale_lock_that_cannot_be_deleted_does_not_prevent_caching() {
+    when(bucketComponent.exists(bucketKey)).thenReturn(false);
+    when(bucketComponent.createIfAbsent(lockKey)).thenReturn(false);
+    when(bucketComponent.lastModified(lockKey))
+        .thenReturn(Optional.of(Instant.now().minus(STALE_LOCK_AGE).minusSeconds(1)));
+    doThrow(accessDenied()).when(bucketComponent).delete(lockKey);
+
+    assertEquals(presigned, subject.getWithCache(url));
+
+    verify(bucketComponent, times(1)).upload(any(File.class), eq(bucketKey));
+  }
+
+  @Test
+  void concurrent_upload_that_never_lands_is_done_ourselves_after_max_wait() {
+    when(bucketComponent.exists(bucketKey)).thenReturn(false);
+    when(bucketComponent.createIfAbsent(lockKey)).thenReturn(false);
+    when(bucketComponent.lastModified(lockKey)).thenReturn(Optional.of(Instant.now()));
+
+    assertEquals(presigned, subject.getWithCache(url));
+
+    verify(bucketComponent, times(1)).upload(any(File.class), eq(bucketKey));
+    verify(bucketComponent, never()).delete(anyString());
+  }
+
+  private static S3Exception accessDenied() {
+    return (S3Exception) S3Exception.builder().statusCode(403).message("Access Denied").build();
   }
 }
