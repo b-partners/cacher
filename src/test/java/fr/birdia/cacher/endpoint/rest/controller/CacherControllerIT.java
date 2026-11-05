@@ -44,6 +44,7 @@ class CacherControllerIT extends FacadeIT {
     assertEquals("8547b3662d07fb7867a11c2c89672a664fd6e4ffb370dee9f60e0e65eeebde09", bucketKey);
 
     when(bucketComponent.exists(bucketKey)).thenReturn(false);
+    when(bucketComponent.createIfAbsent(bucketKey + ".lock")).thenReturn(true);
     when(bucketComponent.presign(eq(bucketKey), any(Duration.class)))
         .thenReturn(
             URI.create("https://example.com/presigned?param1=3&param2=4%20param3=5").toURL());
@@ -51,6 +52,7 @@ class CacherControllerIT extends FacadeIT {
     var response = subject.getWithCache(encodedUrl, "test-api-key");
 
     verify(bucketComponent, times(1)).upload(any(File.class), eq(bucketKey));
+    verify(bucketComponent, times(1)).delete(bucketKey + ".lock");
     assertEquals("https://example.com/presigned?param1=3&param2=4%20param3=5", response);
   }
 }
